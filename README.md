@@ -1,0 +1,265 @@
+<img width="100%" src="https://github.com/user-attachments/assets/da17b160-f289-436f-b140-972083a08602" />
+
+<p align="center">
+  <a href="https://penpot.app/"><b>Website</b></a>  •
+  <a href="https://help.penpot.app/user-guide/"><b>User Guide</b></a>  •
+  <a href="https://help.penpot.app/technical-guide/configuration/"><b>Configuration Guide</b></a>  •
+  <a href="https://community.penpot.app/"><b>Community</b></a>
+</p>
+
+> **About this document** — This README documents *our* self-hosted deployment: what's in `docker-compose.yaml`, how the services fit together, and how to set it up, locally and in production.
+
+## Table of contents
+
+- [Project Overview](#project-overview)
+- [Architecture](#architecture)
+  - [Service Inventory](#service-inventory)
+  - [Architecture Diagram](#architecture-diagram)
+  - [Component Deep Dive](#component-deep-dive)
+  - [Configuration Model](#configuration-model)
+  - [Data & State](#data--state)
+  - [Request Flow Examples](#request-flow-examples)
+- [Setup Instructions](#setup-instructions)
+  - [Prerequisites](#prerequisites)
+  - [Quick Start (Local/Dev)](#quick-start-localdev)
+  - [Production Setup](#production-setup)
+  - [Updating to a New Version](#updating-to-a-new-version)
+  - [Security Checklist](#security-checklist)
+- [Scaling Considerations](#scaling-considerations)
+- [References](#references)
+
+---
+
+## Project Overview
+
+[Penpot](https://penpot.app/) is the open-source design and prototyping platform for teams that build digital products at scale — a self-hostable, Figma-style collaborative design tool built entirely on open web standards (SVG, CSS, HTML, JSON).
+
+What makes Penpot relevant to us as a self-hosted deployment:
+
+- **Full ownership of the design infrastructure.** Nothing about a user's designs, files, or teams leaves our servers.
+- **Real-time collaboration** — co-editing, live cursors, comments — powered by WebSockets and pub/sub, not a third-party sync service.
+- **Design as code.** Design Tokens, an [Inspect mode](https://help.penpot.app/user-guide/) (SVG/CSS/HTML export), and CSS Grid/Flex layout mean design output translates directly to what developers ship.
+- **Programmable via [MCP](https://penpot.app/penpot-mcp-server)** — an open API and Model Context Protocol server let AI agents and external tools read/write Penpot designs, which is why this stack runs its own `penpot-mcp` service.
+- **Deployment-agnostic** — Penpot can run on their SaaS, Kubernetes, Elestio, or, as here, plain Docker Compose on a single host.
+
+This repository currently holds the deployment manifest (`docker-compose.yaml`) for a single-host, Docker Compose-based install — six application services plus supporting infrastructure (PostgreSQL, Valkey, a mail catcher for dev).
+
+## Architecture
+
+### Service Inventory
+
+| Service | Image | Role |
+|---|---|---|
+| `penpot-frontend` | `penpotapp/frontend` | Serves the SPA (web client), acts as reverse proxy in front of backend/exporter/MCP |
+| `penpot-backend` | `penpotapp/backend` | Core application server: API, auth, business logic, persistence, websockets |
+| `penpot-mcp` | `penpotapp/mcp` | Model Context Protocol server — exposes Penpot capabilities to AI agents/assistants |
+| `penpot-exporter` | `penpotapp/exporter` | Headless rendering service for exporting shapes/boards to PNG/SVG/PDF |
+| `penpot-postgres` | `postgres:15` | Primary relational datastore |
+| `penpot-valkey` | `valkey/valkey:8.1` | In-memory store (Redis-compatible fork) for pub/sub & websocket notifications |
+| `penpot-mailcatch` | `sj26/mailcatcher` | Dev/staging SMTP sink — captures outgoing emails for inspection (**not for production**) |
+| `traefik` *(commented out)* | `traefik:v3.3` | Optional reverse proxy / TLS termination for public-internet exposure |
+
+All services share a single user-defined bridge network, **`penpot`**, which provides internal DNS resolution between containers (e.g. `penpot-postgres`, `penpot-valkey`, `penpot-mailcatch` are reachable by service name).
+
+### Architecture Diagram
+
+```
+                                   Internet / LAN
+                                         │
+                                         ▼
+                              ┌─────────────────────┐
+                              │   penpot-frontend    │  :9001 → :8080
+                              │  (SPA + reverse      │
+                              │   proxy)             │
+                              └─────────┬─────────────┘
+                     ┌───────────────────┼───────────────────┐
+                     ▼                   ▼                   ▼
+          ┌─────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+          │  penpot-backend  │ │ penpot-exporter   │ │   penpot-mcp     │
+          │  (API/WS/auth)   │ │ (render/export)   │ │ (AI agent access)│
+          └───┬─────────┬────┘ └─────────┬─────────┘ └──────────────────┘
+              │         │                │
+              ▼         ▼                ▼
+   ┌────────────────┐ ┌───────────────┐ ┌───────────────────────┐
+   │ penpot-postgres │ │ penpot-valkey │ │ penpot-frontend:8080   │
+   │ (relational DB) │ │ (pub/sub, WS  │ │ (exporter fetches      │
+   │                 │ │  notifications)│ │  rendered pages via    │
+   └────────────────┘ └───────────────┘ │  internal HTTP)        │
+                                          └───────────────────────┘
+              │
+              ▼
+   ┌────────────────────┐
+   │ penpot-mailcatch    │  (SMTP :1025 internal, UI :1080 exposed)
+   └────────────────────┘
+
+   Shared volume: penpot_assets (mounted by frontend + backend)
+```
+
+### Component Deep Dive
+
+**`penpot-frontend`** — Serves the compiled ClojureScript/JS SPA and acts as an entry-point reverse proxy, routing API/websocket traffic to the backend, export requests to the exporter, and MCP traffic to the MCP service. Exposes host port **9001** (→ container 8080); this is the URL users hit, matching `PENPOT_PUBLIC_URI`. Mounts the shared `penpot_assets` volume. Depends on `penpot-backend`, `penpot-exporter`, and `penpot-mcp`.
+
+**`penpot-backend`** — The core Clojure application. Handles the REST/WebSocket API and real-time collaboration; authentication (session cookies, OAuth via GitHub/GitLab/Google/LDAP/OIDC — configurable via `PENPOT_FLAGS`); persistence to PostgreSQL; pub/sub through Valkey so multiple instances stay in sync; asset storage (filesystem by default, S3-compatible optional); and transactional email (invitations, verification) via SMTP. Waits for Postgres and Valkey to be **healthy** before starting. `PENPOT_SECRET_KEY` derives all session/invitation subsystem keys — must be changed for any real deployment.
+
+**`penpot-mcp`** — Runs Penpot's Model Context Protocol server so AI assistants/agents can introspect and interact with designs programmatically (list files, read shapes, export elements). Enabled via the `enable-mcp` flag; sits behind the frontend proxy with no directly published port.
+
+**`penpot-exporter`** — A headless-browser rendering service used to export boards/shapes to PNG/SVG/PDF. Talks to `penpot-frontend` over the internal Docker network to render pages exactly as the SPA displays them, then captures the render. Uses Valkey for job coordination and `PENPOT_SECRET_KEY` to validate signed export requests from the backend.
+
+**`penpot-postgres`** — PostgreSQL 15, system of record for all structured data (users, teams, projects, files, comments, versions). `--data-checksums` enabled for corruption detection. Health-checked via `pg_isready`; other services gate startup on it. Data persisted in `penpot_postgres_v15`.
+
+**`penpot-valkey`** — Redis-compatible in-memory store used for WebSocket notification fan-out (so backend replicas scale horizontally) and export job coordination. Capped at 128MB with LFU eviction; no persistence volume by design — its data is transient.
+
+**`penpot-mailcatch`** — A disposable SMTP catch-all for local/dev — intercepts outbound email so nothing is actually delivered. Web UI on host port **1080**; SMTP listens internally on **1025**. **Not for production** — point `PENPOT_SMTP_*` at a real provider instead.
+
+**`traefik`** *(optional, commented out)* — Template for exposing Penpot to the internet with automatic TLS (Let's Encrypt) and Docker-based service discovery. Disabled by default since the stack targets `localhost`.
+
+### Configuration Model
+
+Docker Compose YAML anchors (`x-flags`, `x-uri`, `x-body-size`, `x-secret-key`) centralize shared environment variables and merge them into each service via YAML's `<<` merge key, avoiding duplication across `frontend`, `backend`, and `exporter`.
+
+Key feature flags (`PENPOT_FLAGS`, space-separated):
+
+| Flag | Effect |
+|---|---|
+| `disable-email-verification` | Skip email confirmation on signup (dev convenience) |
+| `enable-smtp` | Turn on email sending |
+| `enable-prepl-server` | Expose a Clojure REPL in the backend container |
+| `disable-secure-session-cookies` | Allow non-HTTPS session cookies — must be re-enabled before exposing to the internet |
+| `enable-mcp` | Turn on the Model Context Protocol integration |
+| `enable-registration` | Allow open self-signup |
+
+Other notable env vars: `PENPOT_PUBLIC_URI` (externally visible base URL), `PENPOT_HTTP_SERVER_MAX_BODY_SIZE` (upload cap, default ~350MB), `PENPOT_SECRET_KEY` (master crypto key, shared by backend and exporter), `PENPOT_DATABASE_URI` / `PENPOT_REDIS_URI` (internal service discovery via Docker DNS).
+
+### Data & State
+
+| Volume | Mounted by | Purpose | Durability |
+|---|---|---|---|
+| `penpot_postgres_v15` | `penpot-postgres` | All relational application data | Persistent |
+| `penpot_assets` | `penpot-frontend`, `penpot-backend` | Uploaded design assets (images, fonts) on the filesystem storage backend | Persistent |
+| `penpot_traefik` *(unused, optional)* | `traefik` | ACME/TLS certificate storage | Persistent |
+
+Valkey holds no durable volume by design — its role is transient pub/sub and cache, not storage of record.
+
+### Request Flow Examples
+
+- **Opening the app:** `browser → penpot-frontend:9001 → (proxy) → penpot-backend (API/WS) → penpot-postgres / penpot-valkey`
+- **Exporting a board:** `browser → frontend → backend (signed export job) → exporter → frontend:8080 (headless render) → exporter returns file → backend/frontend → browser`
+- **Registration email:** `backend → SMTP → mail provider (mailcatch in dev, real SMTP in prod)`
+- **AI agent via MCP:** `AI client → penpot-frontend (proxy) → penpot-mcp → backend API`
+
+## Setup Instructions
+
+### Prerequisites
+
+- Docker Engine + Docker Compose v2 (`docker compose version`)
+- Ports `9001` (app) and `1080` (dev mail UI) free on the host
+- ~2GB RAM free for the full stack (Postgres + Valkey + 4 app services)
+
+### Quick Start (Local/Dev)
+
+```sh
+# from this directory
+docker compose up -d
+
+# check everything is healthy
+docker compose ps
+```
+
+Then open **http://localhost:9001**. Registration emails land in the Mailcatcher UI at **http://localhost:1080** (not a real inbox — dev-only). The default `PENPOT_FLAGS` in `docker-compose.yaml` already disables email verification and secure cookies for frictionless local testing.
+
+To stop: `docker compose down` (add `-v` only if you intentionally want to wipe the Postgres/assets volumes).
+
+### Production Setup
+
+Don't edit `docker-compose.yaml` directly — treat it as the upstream-tracked base file. Layer production changes on top with a `docker-compose.override.yaml`, which Docker Compose merges in automatically (no `-f` flags needed), so future upstream updates never conflict with your local changes.
+
+**Bootstrap `.env` automatically** rather than filling in secrets by hand:
+
+```powershell
+# Windows (PowerShell)
+.\scripts\setup.ps1
+```
+```sh
+# macOS/Linux/WSL
+./scripts/setup.sh
+```
+
+This copies `.env.example` → `.env` and auto-generates a secure `PENPOT_SECRET_KEY` (64 random bytes, URL-safe base64 — same strength as the `secrets.token_urlsafe(64)` approach Penpot's own docs recommend) and a random `POSTGRES_PASSWORD`. It's idempotent and refuses to overwrite an existing `.env`, so re-running it is safe. You still fill in `PENPOT_PUBLIC_URI`, `RESEND_API_KEY`, and `SMTP_FROM_EMAIL` by hand afterward — those can't be auto-generated.
+
+At minimum, the production override should set:
+
+1. **`PENPOT_SECRET_KEY`** — auto-generated above; keep it in `.env` (git-ignored), never commit it.
+2. **`PENPOT_FLAGS`** — drop `disable-secure-session-cookies` and `disable-email-verification`; keep only what production needs (e.g. `enable-smtp enable-mcp enable-registration`).
+3. **`PENPOT_PUBLIC_URI`** — your real domain, e.g. `https://design.yourcompany.com`.
+4. **Postgres credentials** — auto-generated by the setup script above; applied to both `penpot-postgres` and `penpot-backend` via `${POSTGRES_PASSWORD}`.
+5. **SMTP** — point `PENPOT_SMTP_HOST` / `PORT` / `USERNAME` / `PASSWORD` at a real transactional provider (Resend, SES, SendGrid, Mailgun) instead of `penpot-mailcatch`. Gmail/Workspace SMTP can work for very low volume but isn't built for automated sending. Cloudflare has no outbound SMTP relay — not an option.
+6. **TLS termination** — enable the commented-out `traefik` service (or your own reverse proxy) instead of serving raw HTTP.
+
+A minimal example `docker-compose.override.yaml` skeleton (fill in real values via `.env`):
+
+```yaml
+services:
+  penpot-backend:
+    environment:
+      PENPOT_SECRET_KEY: "${PENPOT_SECRET_KEY}"
+      PENPOT_PUBLIC_URI: "${PENPOT_PUBLIC_URI}"
+      PENPOT_DATABASE_PASSWORD: "${POSTGRES_PASSWORD}"
+      PENPOT_SMTP_HOST: "${SMTP_HOST}"
+      PENPOT_SMTP_PORT: "${SMTP_PORT}"
+      PENPOT_SMTP_USERNAME: "${SMTP_USERNAME}"
+      PENPOT_SMTP_PASSWORD: "${SMTP_PASSWORD}"
+  penpot-postgres:
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+  penpot-mailcatch:
+    profiles: ["dev"]   # excluded from default `docker compose up` in prod
+```
+
+### Updating to a New Version
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+Run these **without** an explicit `-f docker-compose.yaml` flag — Compose's default file discovery auto-merges `docker-compose.yaml` with your `docker-compose.override.yaml`. If you explicitly pass `-f`, Compose uses *only* the files you list, which would silently drop your production overrides.
+
+The image tag is controlled by `PENPOT_VERSION` (defaults to `2.16` in this file, e.g. `penpotapp/backend:${PENPOT_VERSION:-2.16}`). Bump it via `.env` (`PENPOT_VERSION=2.17`) rather than editing the base compose file, and check the [Penpot releases](https://github.com/penpot/penpot/releases) before upgrading in production.
+
+#### Automated update pipeline
+
+Two GitHub Actions workflows handle detecting and applying upstream updates:
+
+1. **`.github/workflows/check-penpot-update.yml`** — runs weekly (Monday 06:00 UTC) plus on manual trigger. It polls Penpot's GitHub Releases API (there's no true push/webhook trigger available since we don't own that repo) and:
+   - If a newer version exists, opens a PR bumping the `PENPOT_VERSION` default in `docker-compose.yaml`, with the full release notes in the PR body.
+   - Separately diffs our `docker-compose.yaml` against [upstream's example file](https://github.com/penpot/penpot/blob/develop/docker/images/docker-compose.yaml) to catch structural changes (new services, new env vars) beyond just version bumps — reported in the Actions run summary, not auto-applied.
+2. **`.github/workflows/deploy.yml`** — triggers on push to `main` (i.e. once you merge the version-bump PR) and runs on a **self-hosted runner installed on the Windows server itself**, executing `docker compose pull && docker compose up -d` there directly. GitHub's cloud runners never touch the server — only this self-hosted runner does.
+
+**You still control the gate**: nothing deploys until you review and merge the PR. Once merged, deployment is automatic.
+
+**Setting up the self-hosted runner (one-time, on the Windows PC):**
+1. In the GitHub repo → Settings → Actions → Runners → "New self-hosted runner", choose Windows, and follow the generated PowerShell commands to download/configure/install it as a service.
+2. Set the runner's working directory to this repo's clone location, and make sure `.env` (with real secrets) already exists there — the runner reuses this directory across every deploy run, and `.env` is gitignored so it survives `git pull`/checkout untouched.
+3. Only use a self-hosted runner on a **private** repo — a public repo with a self-hosted runner lets anyone who can open a PR execute code on that machine.
+
+### Security Checklist
+
+- [ ] `PENPOT_SECRET_KEY` changed from the placeholder, generated securely, stored outside version control
+- [ ] `disable-secure-session-cookies` and `disable-email-verification` removed from `PENPOT_FLAGS`
+- [ ] Real SMTP provider configured (Mailcatcher disabled)
+- [ ] Default Postgres credentials changed
+- [ ] TLS termination in front of the frontend (Traefik or equivalent)
+- [ ] `.env` / override files containing secrets are git-ignored
+
+## Scaling Considerations
+
+- `penpot-backend` and `penpot-frontend` are stateless relative to each other — real-time sync goes through Valkey pub/sub, so backend replicas can scale horizontally behind a load balancer.
+- `penpot-postgres` is a single point of failure in this topology; production deployments typically externalize it to a managed/clustered Postgres instance.
+- `penpot-exporter` is CPU/memory-intensive (headless browser rendering) and is a good candidate for independent horizontal scaling under export-heavy workloads.
+
+## References
+
+- Official configuration guide: https://help.penpot.app/technical-guide/configuration/
+- Official architecture docs: https://help.penpot.app/technical-guide/developer/architecture/
+- Penpot releases: https://github.com/penpot/penpot/releases
+- Upstream project repository: https://github.com/penpot/penpot

@@ -1,0 +1,106 @@
+name: Check Penpot upstream version
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, Monday 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get latest Penpot release
+        id: latest
+        run: |
+          RELEASE_JSON=$(curl -sf https://api.github.com/repos/penpot/penpot/releases/latest)
+          LATEST=$(echo "$RELEASE_JSON" | jq -r '.tag_name' | sed 's/^v//')
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          # Release notes body, safe for multi-line GITHUB_OUTPUT
+          {
+            echo "notes<<PENPOT_NOTES_EOF"
+            echo "$RELEASE_JSON" | jq -r '.body // "(no release notes provided)"'
+            echo "PENPOT_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Get currently pinned version
+        id: current
+        run: |
+          CURRENT=$(grep -oP 'PENPOT_VERSION:-\K[0-9.]+' docker-compose.yaml | head -1)
+          echo "version=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Compare
+        id: compare
+        run: |
+          echo "latest=${{ steps.latest.outputs.version }}"
+          echo "current=${{ steps.current.outputs.version }}"
+          if [ "${{ steps.latest.outputs.version }}" != "${{ steps.current.outputs.version }}" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump pinned version
+        if: steps.compare.outputs.changed == 'true'
+        run: |
+          sed -i "s/PENPOT_VERSION:-${{ steps.current.outputs.version }}/PENPOT_VERSION:-${{ steps.latest.outputs.version }}/g" docker-compose.yaml
+
+      - name: Open pull request
+        if: steps.compare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="bump-penpot-${{ steps.latest.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "chore: bump Penpot default version to ${{ steps.latest.outputs.version }}"
+          git push origin "$BRANCH"
+
+          cat > /tmp/pr-body.md << 'PENPOT_BODY_EOF'
+          A new Penpot release was detected: https://github.com/penpot/penpot/releases/tag/v${{ steps.latest.outputs.version }}
+
+          Merging this only updates the default `PENPOT_VERSION` pin in `docker-compose.yaml` — it does not itself pull or restart anything.
+
+          ### Release notes
+          ${{ steps.latest.outputs.notes }}
+
+          ### After merging
+          If auto-deploy is set up, the deploy workflow handles this. Otherwise, on the server:
+          ```sh
+          docker compose pull
+          docker compose up -d
+          ```
+          PENPOT_BODY_EOF
+
+          gh pr create \
+            --title "Bump Penpot to ${{ steps.latest.outputs.version }}" \
+            --body-file /tmp/pr-body.md \
+            --base main \
+            --head "$BRANCH"
+
+  check-compose-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Diff our docker-compose.yaml against upstream's example
+        run: |
+          curl -sf -o /tmp/upstream-compose.yaml \
+            https://raw.githubusercontent.com/penpot/penpot/develop/docker/images/docker-compose.yaml \
+            || { echo "Could not fetch upstream compose file, skipping drift check."; exit 0; }
+
+          if ! diff -u /tmp/upstream-compose.yaml docker-compose.yaml > /tmp/compose.diff; then
+            echo "### Upstream docker-compose.yaml differs from ours" >> "$GITHUB_STEP_SUMMARY"
+            echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/compose.diff >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "Review the Actions run summary for the structural diff (new services/env vars upstream may have added)."
+          else
+            echo "No structural drift from upstream's example compose file."
+          fi

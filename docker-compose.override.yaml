@@ -1,0 +1,56 @@
+# Local production overrides — NOT part of upstream Penpot.
+# Docker Compose auto-merges this on top of docker-compose.yaml, so the
+# base file (pulled from the official Penpot repo) never needs editing
+# and future `docker compose pull && docker compose up -d` runs stay
+# conflict-free with upstream updates.
+#
+# Secrets are read from `.env` (copy .env.example -> .env and fill in
+# real values). Never commit `.env`.
+
+x-prod-flags: &penpot-prod-flags
+  # Production flag set: secure cookies ON, email verification ON
+  # (dev-only `disable-*` flags from the base file are dropped here).
+  PENPOT_FLAGS: enable-smtp enable-mcp enable-registration
+
+services:
+  penpot-frontend:
+    environment:
+      << : *penpot-prod-flags
+      PENPOT_PUBLIC_URI: "${PENPOT_PUBLIC_URI}"
+
+  penpot-backend:
+    environment:
+      << : *penpot-prod-flags
+      PENPOT_PUBLIC_URI: "${PENPOT_PUBLIC_URI}"
+      PENPOT_SECRET_KEY: "${PENPOT_SECRET_KEY}"
+
+      # Stronger Postgres credentials than the base file's dev defaults.
+      PENPOT_DATABASE_PASSWORD: "${POSTGRES_PASSWORD}"
+
+      # --- Real SMTP via Resend ---
+      PENPOT_SMTP_DEFAULT_FROM: "${SMTP_FROM_EMAIL}"
+      PENPOT_SMTP_DEFAULT_REPLY_TO: "${SMTP_FROM_EMAIL}"
+      PENPOT_SMTP_HOST: smtp.resend.com
+      PENPOT_SMTP_PORT: 587
+      PENPOT_SMTP_USERNAME: resend
+      PENPOT_SMTP_PASSWORD: "${RESEND_API_KEY}"
+      PENPOT_SMTP_TLS: "true"
+      PENPOT_SMTP_SSL: "false"
+
+  penpot-exporter:
+    environment:
+      PENPOT_PUBLIC_URI: "${PENPOT_PUBLIC_URI}"
+      PENPOT_SECRET_KEY: "${PENPOT_SECRET_KEY}"
+
+  penpot-postgres:
+    environment:
+      - POSTGRES_INITDB_ARGS=--data-checksums
+      - POSTGRES_DB=penpot
+      - POSTGRES_USER=penpot
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+
+  # Dev-only mail catcher — tagged with a profile so it no longer starts
+  # by default. `docker compose up -d` in prod won't launch it;
+  # `docker compose --profile dev up -d` still can, for local testing.
+  penpot-mailcatch:
+    profiles: ["dev"]

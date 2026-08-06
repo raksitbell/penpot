@@ -1,0 +1,27 @@
+name: Deploy to Windows server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker-compose.yaml"
+      - "docker-compose.prod.yaml"
+      - "docker-compose.override.yaml"
+
+jobs:
+  deploy:
+    # Runs on the self-hosted GitHub Actions runner installed on the
+    # Windows PC that hosts this stack — NOT on GitHub's cloud runners.
+    # See README.md "Auto-deploy (self-hosted runner)" for setup.
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull updated images
+        run: docker compose pull
+
+      - name: Re-apply stack
+        run: docker compose up -d
+
+      - name: Prune old images
+        run: docker image prune -f
