@@ -22,10 +22,25 @@ if (-not (Test-Path $exampleFile)) {
 
 Copy-Item $exampleFile $envFile
 
+# Uses RandomNumberGenerator.Create()+GetBytes() (not the static .Fill()
+# helper, which is .NET 6+ only and unavailable on Windows PowerShell 5.1's
+# .NET Framework runtime) so this works on both Windows PowerShell and
+# PowerShell 7+.
+function New-RandomBytes {
+    param([int]$Length)
+    $buffer = New-Object byte[] $Length
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($buffer)
+    } finally {
+        $rng.Dispose()
+    }
+    return $buffer
+}
+
 function New-UrlSafeSecret {
     param([int]$Bytes = 64)
-    $buffer = New-Object byte[] $Bytes
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
+    $buffer = New-RandomBytes -Length $Bytes
     $b64 = [Convert]::ToBase64String($buffer)
     return $b64.TrimEnd('=').Replace('+', '-').Replace('/', '_')
 }
@@ -33,8 +48,7 @@ function New-UrlSafeSecret {
 function New-AlnumPassword {
     param([int]$Length = 32)
     $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    $buffer = New-Object byte[] $Length
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
+    $buffer = New-RandomBytes -Length $Length
     -join ($buffer | ForEach-Object { $chars[$_ % $chars.Length] })
 }
 
